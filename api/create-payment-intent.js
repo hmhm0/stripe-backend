@@ -57,7 +57,11 @@ export default async function handler(req, res) {
       currency,
       description: safeDescription,
       metadata: safeMetadata,
-      automatic_payment_methods: { enabled: true },
+      // Prevent redirect-based methods so no return_url is required
+      automatic_payment_methods: {
+        enabled: true,
+        allow_redirects: 'never',
+      },// 👈 important
     });
 
     let finalIntent = intent;
