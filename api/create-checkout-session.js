@@ -12,60 +12,46 @@ export default async function handler(req, res) {
       currency = 'SGD',
       description,
       metadata = {},
-      orderId,
-      // optional extras you might pass from the app later:
-      // customerEmail,
-      // locale = 'auto',
+      orderId,            // may be undefined, null, '' — we'll guard it
+      // Optional, if you ever want client-provided URLs:
+      successUrl,
+      cancelUrl,
     } = req.body || {};
 
-    if (!amountCents || amountCents <= 0) {
+    if (!Number.isFinite(amountCents) || amountCents <= 0) {
       return res.status(400).json({ error: 'Invalid amountCents' });
     }
 
-    // Base methods
-    // - 'card' enables regular cards AND wallet buttons like Apple Pay / Google Pay on Checkout
-    // - Add real-time/redirect methods that matter in SG: PayNow + GrabPay (when currency is SGD)
-    const paymentMethodTypes = ['card'];
-    if (currency.toUpperCase() === 'SGD') {
-      paymentMethodTypes.push('paynow', 'grabpay');
+    const pmTypes = ['card'];
+    if (String(currency).toUpperCase() === 'SGD') {
+      pmTypes.push('paynow', 'grabpay');
     }
+
+    // Only include client_reference_id when non-empty
+    const clientRef =
+      typeof orderId === 'string' && orderId.trim().length > 0 ? orderId.trim() : undefined;
+
+    // Always use HTTPS App Links that match your AndroidManifest
+    const success = 'https://stripe-backend-rose.vercel.app/checkout/success?session_id={CHECKOUT_SESSION_ID}';
+    const cancel  = 'https://stripe-backend-rose.vercel.app/checkout/cancel';
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
-      payment_method_types: paymentMethodTypes,
-
+      payment_method_types: pmTypes,
       line_items: [
         {
           price_data: {
             currency,
             product_data: { name: description || 'Home Cafe order' },
-            unit_amount: amountCents, // total amount (in the smallest currency unit)
+            unit_amount: amountCents,
           },
           quantity: 1,
         },
       ],
-
-      // Helps with reconciliation (also appears on the Session/PaymentIntent in Dashboard)
-      client_reference_id: orderId || null,
+      ...(clientRef ? { client_reference_id: clientRef } : {}), // <— guarded
       metadata,
-
-      // Must match your AndroidManifest App Links
-      success_url:
-        'https://stripe-backend-rose.vercel.app/checkout/success?session_id={CHECKOUT_SESSION_ID}',
-      cancel_url:
-        'https://stripe-backend-rose.vercel.app/checkout/cancel',
-
-      // (Optional) Card options
-      // payment_method_options: {
-      //   card: { request_three_d_secure: 'automatic' },
-      // },
-
-      // (Optional) lighten up the page with your customer’s email / locale
-      // customer_email: customerEmail,
-      // locale,
-
-      // (Optional) Allow coupons via Stripe Dashboard promotion codes
-      // allow_promotion_codes: true,
+      success_url: success,
+      cancel_url: cancel,
     });
 
     return res.status(200).json({ url: session.url, id: session.id });
