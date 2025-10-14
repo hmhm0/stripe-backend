@@ -27,11 +27,18 @@ export default async function handler(req, res) {
       pmTypes.push('paynow', 'grabpay');
     }
 
-    // Only include client_reference_id when non-empty
-    const clientRef =
-      typeof orderId === 'string' && orderId.trim().length > 0 ? orderId.trim() : undefined;
+    // Allow either body.orderId OR metadata.order_id (Flutter currently sends metadata)
+    const orderIdFromMeta =
+      typeof metadata?.order_id === 'string' && metadata.order_id.trim().length > 0
+        ? metadata.order_id.trim()
+        : undefined;
 
-    // Always use HTTPS App Links that match your AndroidManifest
+    const clientRef =
+      typeof orderId === 'string' && orderId.trim().length > 0
+        ? orderId.trim()
+        : orderIdFromMeta;
+
+    // Use your verified App Links (kept hard-coded for now)
     const success = 'https://stripe-backend-rose.vercel.app/checkout/success?session_id={CHECKOUT_SESSION_ID}';
     const cancel  = 'https://stripe-backend-rose.vercel.app/checkout/cancel';
 
@@ -48,7 +55,7 @@ export default async function handler(req, res) {
           quantity: 1,
         },
       ],
-      ...(clientRef ? { client_reference_id: clientRef } : {}), // <— guarded
+      ...(clientRef ? { client_reference_id: clientRef } : {}),
       metadata,
       success_url: success,
       cancel_url: cancel,
