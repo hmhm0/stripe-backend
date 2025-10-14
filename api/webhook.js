@@ -1,104 +1,145 @@
 // /api/webhook.js
 import Stripe from 'stripe';
-import { createClient } from '@supabase/supabase-js';
 import getRawBody from 'raw-body';
+import { createClient } from '@supabase/supabase-js';
 
-export const config = {
-  api: {
-    bodyParser: false, // we need the raw body for Stripe signature verification
-  },
-};
+// If this repo is a Next.js project deployed on Vercel, this disables body parsing.
+// (Harmless on Vercel’s serverless functions too.)
+export const config = { api: { bodyParser: false } };
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-  apiVersion: '2023-10-16',
+  apiVersion: '2022-11-15',
 });
+
+// Optional: allow a second secret for local vs prod, try primary then fallback
+function getSigningSecrets() {
+  const primary = process.env.STRIPE_WEBHOOK_SECRET;       // set this!
+  const fallback = process.env.STRIPE_WEBHOOK_SECRET_ALT;  // optional
+  return [primary, fallback].filter(Boolean);
+}
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY // service role so we can bypass RLS on server
+  process.env.SUPABASE_SERVICE_ROLE_KEY // server-side only
 );
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end();
 
-  let event;
+  let rawBody;
   try {
-    const raw = await getRawBody(req);
-    const sig = req.headers['stripe-signature'];
-    event = stripe.webhooks.constructEvent(
-      raw,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
+    rawBody = await getRawBody(req);
   } catch (err) {
-    console.error('[webhook] signature error:', err?.message);
-    return res.status(400).json({ error: 'Invalid signature' });
+    console.error('[webhook] failed to read raw body:', err);
+    return res.status(400).send('Could not read body');
+  }
+
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  // Verify signature with one of the configured secrets
+  const secrets = getSigningSecrets();
+  let verified = false;
+  for (const secret of secrets) {
+    try {
+      event = stripe.webhooks.constructEvent(rawBody, sig, secret);
+      verified = true;
+      break;
+    } catch (err) {
+      // try next secret
+    }
+  }
+  if (!verified) {
+    console.error(
+      '[webhook] signature error: No signatures found matching the expected signature for payload.'
+    );
+    return res.status(400).send('Signature verification failed');
   }
 
   try {
     switch (event.type) {
-      // 1) Store checkout_session_id as soon as Checkout completes
       case 'checkout.session.completed': {
         const s = event.data.object;
-        const orderId =
-          s.client_reference_id || (s.metadata && s.metadata.order_id) || null;
-        if (!orderId) break;
 
-        // Idempotent: only set if empty
-        await supabase
-          .from('orders')
-          .update({ checkout_session_id: s.id })
-          .eq('id', orderId)
-          .is('checkout_session_id', null);
+        // We prefer client_reference_id; fallback to metadata.order_id
+        const orderId =
+          s.client_reference_id ||
+          (s.metadata && s.metadata.order_id) ||
+          null;
+
+        // Pull PI/charge details if available
+        const paymentIntentId = s.payment_intent || null;
+        let chargeId = null;
+        let pmBrand = null;
+        let last4 = null;
+
+        try {
+          if (paymentIntentId) {
+            const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+            const ch = Array.isArray(pi.charges?.data) ? pi.charges.data[0] : null;
+            chargeId = ch?.id ?? null;
+
+            // Try to enrich payment method details
+            pmBrand =
+              ch?.payment_method_details?.card?.brand ||
+              ch?.payment_method_details?.card_present?.brand ||
+              null;
+            last4 =
+              ch?.payment_method_details?.card?.last4 ||
+              ch?.payment_method_details?.card_present?.last4 ||
+              null;
+          }
+        } catch (e) {
+          // Non-fatal: we’ll still mark as paid
+        }
+
+        if (orderId) {
+          // Mark the order as paid in Supabase and store identifiers
+          await supabase
+            .from('orders')
+            .update({
+              status: 'paid',
+              paid_at: new Date().toISOString(),
+              checkout_session_id: s.id ?? null,
+              payment_intent_id: paymentIntentId,
+              charge_id: chargeId,
+              payment_method_brand: pmBrand,
+              payment_last4: last4,
+            })
+            .eq('id', orderId);
+        }
         break;
       }
 
-      // 2) Mark order paid when the PaymentIntent succeeds, capture IDs
       case 'payment_intent.succeeded': {
         const pi = event.data.object;
-        const orderId = pi?.metadata?.order_id || null;
-        if (!orderId) break;
+        const orderId =
+          (pi.metadata && pi.metadata.order_id) ? pi.metadata.order_id : null;
 
-        // Fetch full PI with charges expanded so we can get charge id + card info
-        const piFull = await stripe.paymentIntents.retrieve(pi.id, {
-          expand: ['latest_charge.payment_method_details', 'charges.data'],
-        });
+        let chargeId = null;
+        try {
+          const ch = Array.isArray(pi.charges?.data) ? pi.charges.data[0] : null;
+          chargeId = ch?.id ?? null;
+        } catch (_) {}
 
-        const latestCharge =
-          piFull.latest_charge && typeof piFull.latest_charge === 'object'
-            ? piFull.latest_charge
-            : (piFull.charges?.data || [])[0];
-
-        const chargeId = latestCharge?.id || null;
-
-        let brand = null;
-        let last4 = null;
-        const pmd = latestCharge?.payment_method_details;
-        if (pmd?.card) {
-          brand = pmd.card.brand || null;
-          last4 = pmd.card.last4 || null;
-        }
-
-        // Idempotent update: only promote to paid if not already paid and PI not stored
-        const { error } = await supabase
-          .from('orders')
-          .update({
-            status: 'paid',
-            paid_at: new Date().toISOString(),
-            payment_intent_id: piFull.id,
-            charge_id: chargeId,
-            payment_method_brand: brand,
-            payment_last4: last4,
-          })
-          .eq('id', orderId)
-          .is('payment_intent_id', null); // prevents overwriting if retried
-        if (error) {
-          console.error('[webhook] supabase update error:', error);
+        if (orderId) {
+          await supabase
+            .from('orders')
+            .update({
+              status: 'paid',
+              paid_at: new Date().toISOString(),
+              payment_intent_id: pi.id,
+              charge_id: chargeId,
+            })
+            .eq('id', orderId);
         }
         break;
       }
 
+      // You can handle refunds/cancellations here later
+
       default:
-        // ignore other events
+        // noop
         break;
     }
 
