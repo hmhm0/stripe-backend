@@ -11,6 +11,7 @@
   "license": "ISC",
   "dependencies": {
     "@supabase/supabase-js": "^2.75.0",
+    "raw-body": "^3.0.1",
     "stripe": "^18.5.0"
   }
 }
