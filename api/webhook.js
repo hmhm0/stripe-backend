@@ -1,92 +1,110 @@
 // /api/webhook.js
 import Stripe from 'stripe';
 import { createClient } from '@supabase/supabase-js';
+import getRawBody from 'raw-body';
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+export const config = {
+  api: {
+    bodyParser: false, // we need the raw body for Stripe signature verification
+  },
+};
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: '2023-10-16',
+});
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY // service role so we can bypass RLS on server
 );
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end();
 
-  // In prod you should verify the signature with STRIPE_WEBHOOK_SECRET
-  // For now we trust the forwarded JSON from Stripe CLI / Vercel
-  const event = req.body;
+  let event;
+  try {
+    const raw = await getRawBody(req);
+    const sig = req.headers['stripe-signature'];
+    event = stripe.webhooks.constructEvent(
+      raw,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('[webhook] signature error:', err?.message);
+    return res.status(400).json({ error: 'Invalid signature' });
+  }
 
   try {
     switch (event.type) {
+      // 1) Store checkout_session_id as soon as Checkout completes
       case 'checkout.session.completed': {
-        const session = event.data.object;
-
-        // Prefer client_reference_id; fall back to metadata.order_id
+        const s = event.data.object;
         const orderId =
-          session?.client_reference_id ||
-          (session?.metadata && session.metadata.order_id) ||
-          null;
+          s.client_reference_id || (s.metadata && s.metadata.order_id) || null;
+        if (!orderId) break;
 
-        if (!orderId) {
-          console.warn('[webhook] no orderId in session; skipping update');
-          break;
+        // Idempotent: only set if empty
+        await supabase
+          .from('orders')
+          .update({ checkout_session_id: s.id })
+          .eq('id', orderId)
+          .is('checkout_session_id', null);
+        break;
+      }
+
+      // 2) Mark order paid when the PaymentIntent succeeds, capture IDs
+      case 'payment_intent.succeeded': {
+        const pi = event.data.object;
+        const orderId = pi?.metadata?.order_id || null;
+        if (!orderId) break;
+
+        // Fetch full PI with charges expanded so we can get charge id + card info
+        const piFull = await stripe.paymentIntents.retrieve(pi.id, {
+          expand: ['latest_charge.payment_method_details', 'charges.data'],
+        });
+
+        const latestCharge =
+          piFull.latest_charge && typeof piFull.latest_charge === 'object'
+            ? piFull.latest_charge
+            : (piFull.charges?.data || [])[0];
+
+        const chargeId = latestCharge?.id || null;
+
+        let brand = null;
+        let last4 = null;
+        const pmd = latestCharge?.payment_method_details;
+        if (pmd?.card) {
+          brand = pmd.card.brand || null;
+          last4 = pmd.card.last4 || null;
         }
 
-        // session.payment_intent may be a string (id) or null
-        const paymentIntentId =
-          typeof session.payment_intent === 'string'
-            ? session.payment_intent
-            : (session?.payment_intent?.id ?? null);
-
-        // If you really want the charge id, you can fetch the PI (costs an API call)
-        // Keep it optional for now.
-        let chargeId = null;
-        if (paymentIntentId) {
-          try {
-            const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
-            // latest_charge is a string charge id on the PI
-            chargeId = typeof pi.latest_charge === 'string' ? pi.latest_charge : null;
-          } catch (e) {
-            console.warn('[webhook] could not retrieve PI:', e?.message || e);
-          }
-        }
-
+        // Idempotent update: only promote to paid if not already paid and PI not stored
         const { error } = await supabase
           .from('orders')
           .update({
             status: 'paid',
             paid_at: new Date().toISOString(),
-            payment_intent_id: paymentIntentId,
+            payment_intent_id: piFull.id,
             charge_id: chargeId,
+            payment_method_brand: brand,
+            payment_last4: last4,
           })
-          .eq('id', orderId);
-
+          .eq('id', orderId)
+          .is('payment_intent_id', null); // prevents overwriting if retried
         if (error) {
           console.error('[webhook] supabase update error:', error);
-          // Still return 200 so Stripe doesn’t retry forever; log for ops to inspect
-        } else {
-          console.log('[webhook] order marked paid:', {
-            orderId,
-            paymentIntentId,
-            chargeId,
-          });
         }
         break;
       }
 
-      // (Optional hardening) If you also want to react to PI events:
-      case 'payment_intent.succeeded':
-        // no-op; covered by checkout.session.completed above
-        break;
-
       default:
-        // Not interested; acknowledge
+        // ignore other events
         break;
     }
 
     return res.status(200).json({ received: true });
   } catch (err) {
     console.error('[webhook] handler error:', err);
-    // Return 200 to avoid Stripe retries while you iterate; switch to 500 once stable
-    return res.status(200).json({ received: true, note: 'swallowed error during dev' });
+    return res.status(500).json({ error: 'Webhook handler failed' });
   }
 }
