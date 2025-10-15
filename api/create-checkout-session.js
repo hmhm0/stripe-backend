@@ -1,41 +1,39 @@
 // /api/create-checkout-session.js
-// Creates a Stripe Checkout Session and returns { success, id, url }.
-// Works with both HTTPS App Links and custom-scheme deep links.
-// 
-// Required env (Vercel):
-//  - STRIPE_SECRET_KEY=sk_live_... (or sk_test_... in test)
-
 import Stripe from "stripe";
-
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 
 // --- Helpers -----------------------------------------------------------------
 
-/** Ensure we have something that looks like an absolute URL or custom-scheme URL */
 function isAcceptableReturnUrl(u) {
   try {
     const url = new URL(u);
-    // Accept any scheme; Stripe just needs a valid absolute URL string.
-    // (https for App Links, custom scheme like myapp:// for deep links)
-    return !!url.protocol && !!url.host;
+    return !!url.protocol && !!url.host; // works for https:// and custom schemes with host
   } catch {
-    // Also allow custom schemes of the form: myapp://host/path?x=y without a host? (rare)
-    // But URL() requires a host, so fall back to a looser check:
+    // Accept custom scheme without host: myapp://path
     return typeof u === "string" && /^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\//.test(u);
   }
 }
 
-/** Append/override query params while preserving existing ones */
+/** Append query params; supports https and custom schemes (even without host) */
 function withParams(baseUrl, params) {
-  const u = new URL(baseUrl);
-  Object.entries(params || {}).forEach(([k, v]) => {
-    if (v === undefined || v === null) return;
-    u.searchParams.set(k, String(v));
-  });
-  return u.toString();
+  try {
+    const u = new URL(baseUrl);
+    Object.entries(params || {}).forEach(([k, v]) => {
+      if (v === undefined || v === null) return;
+      u.searchParams.set(k, String(v));
+    });
+    return u.toString();
+  } catch {
+    // Fallback: manual append (for custom schemes that URL() can’t parse)
+    const q = Object.entries(params || {})
+      .filter(([, v]) => v !== undefined && v !== null)
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+      .join("&");
+    if (!q) return baseUrl;
+    return baseUrl.includes("?") ? `${baseUrl}&${q}` : `${baseUrl}?${q}`;
+  }
 }
 
-/** Choose the best success/cancel URLs from body (new or legacy keys) */
 function pickReturnUrls(body) {
   const success = body?.successUrl || body?.successReturnUrl;
   const cancel  = body?.cancelUrl  || body?.cancelReturnUrl;
@@ -48,17 +46,9 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
 
   try {
-    const {
-      amountCents,
-      currency,
-      description,
-      metadata,
-      orderId, // preferred explicit order id from app
-    } = req.body || {};
-
+    const { amountCents, currency, description, metadata, orderId } = req.body || {};
     const { success: rawSuccess, cancel: rawCancel } = pickReturnUrls(req.body);
 
-    // Validate basics
     if (!Number.isFinite(amountCents) || amountCents <= 0) {
       return res.status(400).json({ success: false, error: "Invalid amountCents" });
     }
@@ -72,20 +62,15 @@ export default async function handler(req, res) {
       return res.status(400).json({ success: false, error: "Valid cancelUrl (or cancelReturnUrl) is required" });
     }
 
-    // Resolve order id (prefer explicit)
     const resolvedOrderId = orderId || metadata?.order_id;
-    // Build success/cancel with required params
-    // NOTE: Stripe will expand {CHECKOUT_SESSION_ID} to the created session id.
+
+    // Only success needs session_id; include order_id to help UX/debug
     const successUrl = withParams(rawSuccess, {
       order_id: resolvedOrderId,
       session_id: "{CHECKOUT_SESSION_ID}",
-      // Optional extra aliases your app may also accept:
-      cs_id: "{CHECKOUT_SESSION_ID}",
     });
     const cancelUrl = withParams(rawCancel, {
       order_id: resolvedOrderId,
-      session_id: "{CHECKOUT_SESSION_ID}",
-      cs_id: "{CHECKOUT_SESSION_ID}",
     });
 
     const session = await stripe.checkout.sessions.create({
@@ -93,17 +78,15 @@ export default async function handler(req, res) {
       payment_method_types: ["card"],
       success_url: successUrl,
       cancel_url: cancelUrl,
-      client_reference_id: resolvedOrderId || undefined, // helps correlate on success/cancel
-      line_items: [
-        {
-          price_data: {
-            currency,
-            product_data: { name: description || "Order" },
-            unit_amount: amountCents,
-          },
-          quantity: 1,
+      client_reference_id: resolvedOrderId || undefined,
+      line_items: [{
+        price_data: {
+          currency,
+          product_data: { name: description || "Order" },
+          unit_amount: amountCents,
         },
-      ],
+        quantity: 1,
+      }],
       metadata: {
         ...(metadata || {}),
         ...(resolvedOrderId ? { order_id: resolvedOrderId } : {}),
