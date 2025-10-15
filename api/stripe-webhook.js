@@ -1,8 +1,8 @@
 // /api/stripe-webhook.js
-// Verifies signature, reads Checkout Session + PaymentIntent, and updates Supabase `orders`.
+// Verifies signature, reads Checkout Session/PaymentIntent, updates Supabase `orders`.
 //
 // Required env (Vercel):
-//  - STRIPE_SECRET_KEY=sk_live_... (or sk_test_... in test)
+//  - STRIPE_SECRET_KEY=sk_live_... (or sk_test_...)
 //  - STRIPE_WEBHOOK_SECRET=whsec_...
 //  - SUPABASE_URL=https://xxx.supabase.co
 //  - SUPABASE_SERVICE_ROLE_KEY=service-role-key
@@ -22,12 +22,8 @@ const {
   SUPABASE_SERVICE_ROLE_KEY,
 } = process.env;
 
-if (!STRIPE_SECRET_KEY) {
-  throw new Error("Missing STRIPE_SECRET_KEY");
-}
-if (!STRIPE_WEBHOOK_SECRET) {
-  throw new Error("Missing STRIPE_WEBHOOK_SECRET");
-}
+if (!STRIPE_SECRET_KEY) throw new Error("Missing STRIPE_SECRET_KEY");
+if (!STRIPE_WEBHOOK_SECRET) throw new Error("Missing STRIPE_WEBHOOK_SECRET");
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
 }
@@ -35,14 +31,19 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-/** Returns true if local row is already terminal (avoid re-updates) */
+// ---- helpers ----
+
+const isUuid = (s) =>
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(
+    String(s || "")
+  );
+
 function isTerminal(status) {
   if (typeof status !== "string") return false;
   const s = status.toLowerCase();
   return s === "paid" || s === "completed" || s === "canceled";
 }
 
-/** Safely extracts (brand, last4, chargeId) from PI expanded object */
 function extractCardBitsFromPI(pi) {
   let brand = null,
     last4 = null,
@@ -63,9 +64,13 @@ function extractCardBitsFromPI(pi) {
   return { brand, last4, chargeId };
 }
 
-/** Updates a single order row if not already terminal */
 async function markOrderPaid(orderId, fields) {
-  // Check current status (idempotency)
+  if (!isUuid(orderId)) {
+    console.warn("[webhook] invalid order_id, ignoring event:", orderId);
+    return { ok: true, ignored: true };
+  }
+
+  // Idempotency check
   const { data: rows, error: readErr } = await supabase
     .from("orders")
     .select("id,status")
@@ -78,17 +83,20 @@ async function markOrderPaid(orderId, fields) {
   }
   if (!rows || rows.length === 0) {
     console.warn("[webhook] order not found:", orderId);
-    // Acknowledge anyway to avoid retries; you may want to alert ops here.
+    // Acknowledge so Stripe doesn't retry forever (you can alert ops here)
     return { ok: true, reason: "not_found" };
   }
 
   const current = rows[0]?.status;
   if (isTerminal(current)) {
-    // Already paid/completed/canceled — do nothing
     return { ok: true, reason: "already_terminal" };
   }
 
-  const { error: updErr } = await supabase.from("orders").update(fields).eq("id", orderId);
+  const { error: updErr } = await supabase
+    .from("orders")
+    .update(fields)
+    .eq("id", orderId);
+
   if (updErr) {
     console.error("[webhook] Supabase update failed:", updErr);
     return { ok: false, reason: "update_failed" };
@@ -96,9 +104,8 @@ async function markOrderPaid(orderId, fields) {
   return { ok: true };
 }
 
-/** Handles a Checkout Session (completed/async_succeeded) */
 async function handleCheckoutSession(session) {
-  // Prefer metadata.order_id; fallback to client_reference_id if you set it on creation
+  // Prefer metadata.order_id; fallback to client_reference_id
   const orderId =
     session?.metadata?.order_id ||
     session?.metadata?.orderId ||
@@ -106,11 +113,11 @@ async function handleCheckoutSession(session) {
     null;
 
   if (!orderId) {
-    console.warn("[webhook] session without order_id/client_reference_id; ignored");
+    console.warn("[webhook] session missing order_id/client_reference_id; ignored");
     return { ignored: true };
   }
 
-  // Retrieve session again with deep expand for consistent shape
+  // Re-retrieve with expand for consistent PI/charge shape
   const fullSession = await stripe.checkout.sessions.retrieve(session.id, {
     expand: ["payment_intent.latest_charge", "payment_intent.payment_method"],
   });
@@ -137,13 +144,11 @@ async function handleCheckoutSession(session) {
   return await markOrderPaid(orderId, updates);
 }
 
-/** Fallback for PI-only flows (if you ever charge without Checkout Session) */
 async function handlePaymentIntentSucceeded(piEventObject) {
   const orderId =
     piEventObject?.metadata?.order_id || piEventObject?.metadata?.orderId || null;
   if (!orderId) return { ignored: true };
 
-  // Retrieve PI with expand to extract card and latest charge
   const full = await stripe.paymentIntents.retrieve(piEventObject.id, {
     expand: ["latest_charge", "payment_method"],
   });
@@ -161,6 +166,8 @@ async function handlePaymentIntentSucceeded(piEventObject) {
 
   return await markOrderPaid(orderId, updates);
 }
+
+// ---- handler ----
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end("Method Not Allowed");
@@ -190,7 +197,6 @@ export default async function handler(req, res) {
         return res.json({ received: true, ...result });
       }
 
-      // You can optionally log failures/expired for support:
       case "checkout.session.expired":
       case "payment_intent.payment_failed": {
         console.warn("[webhook]", event.type, event.data?.object?.id);
