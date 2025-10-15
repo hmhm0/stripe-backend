@@ -1,8 +1,8 @@
 {
-  "rewrites": [
+  "headers": [
     {
       "source": "/.well-known/assetlinks.json",
-      "destination": "/api/assetlinks"
+      "headers": [{ "key": "Content-Type", "value": "application/json; charset=utf-8" }]
     }
   ]
 }
