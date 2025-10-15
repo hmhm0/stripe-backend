@@ -1,105 +1,117 @@
-// Vercel Serverless Function: POST /api/create-payment-intent
-// Body JSON:
-// {
-//   amount?: number,                 // in cents
-//   amountCents?: number,            // alias (preferred name in your app)
-//   currency?: string,               // default 'sgd'
-//   description?: string,            // optional
-//   desc?: string,                   // alias (client convenience)
-//   metadata?: object,               // optional
-//   testAutoConfirm?: boolean,       // TEST mode helper; confirms with pm_card_visa
-//   allowRedirects?: 'never'|'always'// default 'never' (no redirect methods in PaymentSheet)
-// }
-import Stripe from 'stripe';
+// /api/create-payment-intent.js
+// Creates a PaymentIntent for in-app payments (PaymentSheet).
+//
+// Required env:
+//   STRIPE_SECRET_KEY=sk_live_... or sk_test_...
+// Optional env:
+//   ORIGIN_ALLOWLIST=https://example.com,capacitor://localhost,ionic://localhost,http://localhost:3000
+
+import Stripe from "stripe";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-  apiVersion: '2024-06-20',
+  apiVersion: "2024-06-20",
 });
 
-export default async function handler(req, res) {
-  // Basic CORS (tighten this to your app origin before prod)
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'content-type');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+// --- optional CORS allow-list ---
+function cors(req, res) {
+  const allow = (process.env.ORIGIN_ALLOWLIST || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
 
-  if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST') {
-    res.setHeader('Allow', 'POST, OPTIONS');
-    return res.status(405).json({ error: 'Method Not Allowed' });
+  const origin = req.headers.origin;
+  const isAllowed = origin && allow.length > 0 && allow.includes(origin);
+
+  if (isAllowed) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Headers", "content-type,x-idempotency-key");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return true;
+  }
+  return false;
+}
+
+export default async function handler(req, res) {
+  if (cors(req, res)) return;
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST, OPTIONS");
+    return res.status(405).json({ success: false, error: "method_not_allowed" });
   }
 
   try {
     const {
       amount,
-      amountCents, // alias
-      currency: rawCurrency = 'sgd',
+      amountCents,                 // preferred
+      currency = "sgd",
       description,
-      desc, // alias
+      desc,                        // alias
       metadata,
-      testAutoConfirm = false,
-      allowRedirects = 'never', // <- keep "never" for in-app PaymentSheet
+      allowRedirects = "never",    // keep "never" to avoid redirect methods in-app
     } = req.body || {};
 
-    const cents = Number.isFinite(amountCents) ? amountCents : amount;
-    if (!Number.isFinite(cents) || cents <= 0) {
-      return res.status(400).json({ error: 'Invalid amount (in cents) required' });
+    const cents = Number.isFinite(amountCents) ? Number(amountCents) : Number(amount);
+    if (!Number.isInteger(cents) || cents <= 0) {
+      return res.status(400).json({ success: false, error: "invalid_amount_cents" });
     }
 
-    const currency = String(rawCurrency || 'sgd').toLowerCase();
+    const cur = String(currency || "sgd").trim().toLowerCase();
+    if (!/^[a-z]{3}$/.test(cur)) {
+      return res.status(400).json({ success: false, error: "invalid_currency" });
+    }
+
     const safeDescription =
-      typeof description === 'string' && description.length > 0
+      typeof description === "string" && description.length > 0
         ? description
-        : typeof desc === 'string'
+        : typeof desc === "string" && desc.length > 0
         ? desc
         : undefined;
-    const safeMetadata = metadata && typeof metadata === 'object' ? metadata : undefined;
+
+    const safeMetadata = metadata && typeof metadata === "object" ? metadata : undefined;
 
     if (!process.env.STRIPE_SECRET_KEY) {
-      return res.status(500).json({ error: 'Stripe secret key not configured' });
+      return res.status(500).json({ success: false, error: "missing_stripe_key" });
     }
 
-    // IMPORTANT:
-    // - PaymentSheet (in-app) works great with automatic_payment_methods.enabled = true
-    // - We set allow_redirects: 'never' so redirect methods (PayNow, GrabPay) are EXCLUDED here.
-    //   Those are handled by your Checkout Session flow instead.
-    // - Apple Pay / Google Pay are surfaced by PaymentSheet when card is available & device supports it.
-    const intent = await stripe.paymentIntents.create(
-      {
-        amount: cents,
-        currency,
-        description: safeDescription,
-        metadata: safeMetadata,
-        automatic_payment_methods: {
-          enabled: true,
-          allow_redirects: allowRedirects === 'always' ? 'always' : 'never',
-        },
+    const body = {
+      amount: cents,
+      currency: cur,
+      description: safeDescription,
+      metadata: safeMetadata,
+      automatic_payment_methods: {
+        enabled: true,
+        // Keep redirect methods out of PaymentSheet; use Checkout for those.
+        allow_redirects: allowRedirects === "always" ? "always" : "never",
       },
-      // Optional: idempotency to avoid double-charges if client retries
-      // (You can pass a header like x-idempotency-key from the app)
-      // { idempotencyKey: req.headers['x-idempotency-key'] }
+    };
+
+    const idem = req.headers["x-idempotency-key"];
+    const intent = await stripe.paymentIntents.create(
+      body,
+      idem ? { idempotencyKey: String(idem) } : undefined
     );
 
-    let finalIntent = intent;
-
-    // TEST helper: auto-confirm with a test card (only works with sk_test_*)
-    if (testAutoConfirm && process.env.STRIPE_SECRET_KEY.startsWith('sk_test_')) {
-      finalIntent = await stripe.paymentIntents.confirm(intent.id, {
-        payment_method: 'pm_card_visa',
-      });
-    }
-
+    // Standardize response shape for the app:
+    //  - success: boolean
+    //  - id: PaymentIntent id
+    //  - clientSecret: client secret (if you later use PaymentSheet)
+    //  - status: Stripe status for logging
     return res.status(200).json({
-      id: finalIntent.id,
-      status: finalIntent.status,
-      clientSecret: finalIntent.client_secret ?? null,
+      success: true,
+      id: intent.id,
+      clientSecret: intent.client_secret ?? null,
+      status: intent.status,
     });
   } catch (err) {
-    console.error('[create-payment-intent] error', err);
+    console.error("[create-payment-intent] error", err);
     return res.status(500).json({
-      id: 'server_error',
-      status: 'failed',
-      error: typeof err?.message === 'string' ? err.message : 'server_error',
+      success: false,
+      id: null,
+      status: "failed",
+      error: typeof err?.message === "string" ? err.message : "server_error",
     });
   }
-  console.log('[PI] incoming body:', req.body);
 }
