@@ -109,12 +109,6 @@ export default async function handler(req, res) {
 
       if (upErr) console.error("[confirm-session] supabase update error:", upErr);
 
-      try {
-        await supabase.rpc("recalc_order_totals", { p_order_id: orderId });
-      } catch (e) {
-        console.warn("[confirm-session] recalc_order_totals failed", e.message);
-      }
-
       return res.status(200).json({
         ok: true,
         paid: true,
