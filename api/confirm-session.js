@@ -1,68 +1,111 @@
 // /api/confirm-session.js
-// Verifies a Stripe Checkout Session by id (session_id / cs_id).
-// Returns { ok, paid, orderId, status, paymentStatus, piStatus }.
-
 import Stripe from "stripe";
+import { createClient } from "@supabase/supabase-js";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
-// small helper: wait
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/**
+ * Extract a few useful payment fields from Stripe objects.
+ */
+function extractPaymentMeta(session, pi, charge) {
+  const brand = charge?.payment_method_details?.card?.brand ?? null;
+  const last4 = charge?.payment_method_details?.card?.last4 ?? null;
 
-// fetch + decide paid
-async function fetchAndJudge(sessionId) {
-  const session = await stripe.checkout.sessions.retrieve(sessionId, {
-    expand: ["payment_intent"],
-  });
-
-  const status = session.status;                     // 'open' | 'complete' | ...
-  const paymentStatus = session.payment_status;      // 'paid' | 'unpaid' | 'no_payment_required'
-  const pi = session.payment_intent;
-  const piStatus = pi && typeof pi === "object" ? pi.status : null; // 'succeeded' etc.
-
-  const paid =
-    paymentStatus === "paid" ||
-    status === "complete" ||
-    piStatus === "succeeded";
-
-  // Prefer explicit order id that you set as client_reference_id or metadata.order_id
-  const orderId = session.client_reference_id || session.metadata?.order_id || null;
-
-  return { paid, orderId, status, paymentStatus, piStatus };
+  return {
+    checkout_session_id: session?.id ?? null,
+    payment_intent_id: pi?.id ?? null,
+    charge_id: charge?.id ?? null,
+    payment_method_brand: brand,
+    payment_last4: last4,
+  };
 }
 
 export default async function handler(req, res) {
   if (req.method !== "GET" && req.method !== "POST") {
-    return res.status(405).end("Method Not Allowed");
+    return res.status(405).json({ ok: false, error: "method_not_allowed" });
   }
 
   try {
+    // Accept both GET and POST: session_id and optional order_id
     const sessionId =
-      req.query.session_id ||
-      req.query.cs_id ||
-      req.body?.session_id ||
-      req.body?.cs_id;
+      (req.method === "GET" ? req.query.session_id : req.body?.session_id) || "";
+    const hintedOrderId =
+      (req.method === "GET" ? req.query.order_id : req.body?.order_id) || "";
 
-    if (!sessionId) {
-      return res.status(400).json({ ok: false, paid: false, error: "missing_session_id" });
+    if (!sessionId || !String(sessionId).startsWith("cs_")) {
+      return res.status(400).json({ ok: false, error: "invalid_session_id" });
     }
 
-    // Retry a few times to out-wait Stripe’s eventual consistency
-    const attempts = [0, 400, 900, 1500]; // ms
-    let last = null;
+    // Retrieve the session with expands so we can make a robust decision
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["payment_intent", "payment_intent.charges.data"],
+    });
 
-    for (let i = 0; i < attempts.length; i++) {
-      if (i > 0) await sleep(attempts[i]);
-      last = await fetchAndJudge(sessionId);
-      if (last.paid) {
-        return res.json({ ok: true, paid: true, orderId: last.orderId, ...last });
+    const pi = session.payment_intent && typeof session.payment_intent === "object"
+      ? session.payment_intent
+      : null;
+
+    // Pick the first charge (for card there will be one)
+    const charge = pi?.charges?.data?.[0] ?? null;
+
+    // Determine paid
+    const sessionPaid =
+      session?.status === "complete" || session?.payment_status === "paid";
+    const intentSucceeded = pi?.status === "succeeded";
+    const isPaid = Boolean(sessionPaid || intentSucceeded);
+
+    // Figure out order id
+    const orderId =
+      hintedOrderId ||
+      session?.client_reference_id ||
+      session?.metadata?.order_id ||
+      null;
+
+    // If it’s paid and we have an order id, update Supabase
+    if (isPaid && orderId) {
+      const meta = extractPaymentMeta(session, pi, charge);
+
+      // Update orders set status + payment info.
+      // (Column names assume your earlier schema; adjust if needed.)
+      const { error: upErr } = await supabase
+        .from("orders")
+        .update({
+          status: "paid",
+          paid_at: new Date().toISOString(),
+          checkout_session_id: meta.checkout_session_id,
+          payment_intent_id: meta.payment_intent_id,
+          charge_id: meta.charge_id,
+          payment_method_brand: meta.payment_method_brand,
+          payment_last4: meta.payment_last4,
+        })
+        .eq("id", orderId);
+
+      if (upErr) {
+        // Don’t fail the confirm if DB write has a transient issue
+        console.error("[confirm-session] supabase update error:", upErr);
       }
+
+      // Optional but nice: ensure totals are fresh (name matches your function)
+      try {
+        await supabase.rpc("recalc_order_totals", { p_order_id: orderId });
+      } catch (e) {
+        // swallow (best effort)
+      }
+
+      return res.status(200).json({ ok: true, paid: true, orderId });
     }
 
-    // Still not paid
-    return res.json({ ok: true, paid: false, orderId: last?.orderId || null, ...last });
+    // Not paid yet (webhook may update it a moment later)
+    return res.status(200).json({
+      ok: true,
+      paid: false,
+      orderId: orderId || null,
+      session: { id: session.id, status: session.status, payment_status: session.payment_status },
+      intent: { id: pi?.id ?? null, status: pi?.status ?? null },
+    });
   } catch (e) {
     console.error("[confirm-session] error:", e);
-    return res.status(500).json({ ok: false, paid: false, error: "server_error" });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 }
