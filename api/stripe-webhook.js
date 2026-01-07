@@ -30,35 +30,8 @@ function extractCardBitsFromPI(pi) {
     chargeId: ch?.id ?? null,
   };
 }
-// Updated: Logs FULL payload for debugging
-async function logStripeEventOnce(event) {
-  try {
-    const { data, error } = await supabase
-      .from("stripe_event_logs")
-      .insert({
-        event_id: event.id,
-        type: event.type,
-        payload: event, // <--- NEW: Stores the full JSON body
-        created_at: new Date().toISOString(),
-      })
-      .select("event_id")
-      .maybeSingle();
-    if (error) {
-      if (String(error.message || "").toLowerCase().includes("duplicate")) {
-        return { alreadyProcessed: true };
-      }
-      // If column 'payload' is missing, this might error. Ensure logic handles it?
-      // For now we assume you ran the schema update.
-      console.error("[logStripeEventOnce] DB Insert Error:", error.message);
-      return { error };
-    }
-    return { ok: true, id: data?.event_id };
-  } catch (e) {
-    console.error("[logStripeEventOnce] Exception:", e);
-    // Swallow logging errors; never block payment handling
-    return { loggingDisabled: true };
-  }
-}
+// [Removed logStripeEventOnce per Lite configuration]
+// We rely on Stripe Dashboard for webhook logs.
 async function callMarkOrderPaid({
   orderId,
   checkoutSessionId,
@@ -213,10 +186,9 @@ export default async function handler(req, res) {
     console.error("[webhook] signature verify failed:", err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
-  const logResult = await logStripeEventOnce(event);
-  if (logResult?.alreadyProcessed) {
-    return res.json({ ok: true, reason: "duplicate_event" });
-  }
+  // [Lite] Skipping DB logging; check Stripe Dashboard if needed.
+  // const logResult = await logStripeEventOnce(event);
+  // if (logResult?.alreadyProcessed) { ... }
   try {
     switch (event.type) {
       case "checkout.session.completed":
